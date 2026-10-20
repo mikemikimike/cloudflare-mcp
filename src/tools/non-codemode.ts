@@ -15,7 +15,7 @@ import { DOCS_TOOL, runDocsTool } from './docs-search'
 import { WHOAMI_TOOL, WhoamiInputSchema, runWhoamiTool } from './whoami'
 import { zodInputSchemaFromJson, type McpTool } from '../openapi'
 import type { AuthProps } from '../auth/types'
-import type { Connection } from '../api-permissions'
+import { acceptedPermissions, explainEmptyList, type Connection } from '../api-permissions'
 import { explainRefusalFor } from '../api-refusal-hint'
 import { WWW_AUTHENTICATE_META_KEY, type ScopeChallenge } from '../scope-challenge'
 
@@ -127,9 +127,26 @@ async function callNonCodemodeTool(
     ? await response.json()
     : await response.text()
 
-  if (response.ok) return { content: [{ type: 'text', text: formatResult(result) }] }
-
   const method = tool.method.toUpperCase()
+  if (response.ok) {
+    const success: CallToolResult = { content: [{ type: 'text', text: formatResult(result) }] }
+    // Cloudflare filters some lists to what the credential may see instead of
+    // refusing, so an empty one from a read the connection holds no accepted
+    // scope for proves nothing. Say so and step up, as for a refusal.
+    const emptyList = isEmptyList(result)
+      ? explainEmptyList(
+          connection,
+          method,
+          tool.path,
+          acceptedPermissions({ 'x-api-token-group': tool.permissions })
+        )
+      : undefined
+    if (!emptyList) return success
+    success.content[0] = { type: 'text', text: `${formatResult(result)}\n\n${emptyList.hint}` }
+    const challenge = emptyList.scope ? scopeChallenge.require(emptyList.scope) : undefined
+    return challenge ? { ...success, _meta: { [WWW_AUTHENTICATE_META_KEY]: [challenge] } } : success
+  }
+
   // The generated tool already names its endpoint's template and accepted permissions.
   const refusal = explainRefusalFor(response.status, connection, method, tool.path, {
     'x-api-token-group': tool.permissions
@@ -147,6 +164,15 @@ async function callNonCodemodeTool(
   // One refused request changed nothing, so the client can retry the call after stepping up.
   const challenge = refusal?.scope ? scopeChallenge.require(refusal.scope) : undefined
   return challenge ? { ...failure, _meta: { [WWW_AUTHENTICATE_META_KEY]: [challenge] } } : failure
+}
+
+/** Whether a response body is an empty list, bare or in the REST envelope's `result`. */
+function isEmptyList(body: unknown): boolean {
+  const list =
+    body !== null && typeof body === 'object' && !Array.isArray(body) && 'result' in body
+      ? body.result
+      : body
+  return Array.isArray(list) && list.length === 0
 }
 
 function validationError(name: string, error: z.ZodError): CallToolResult {

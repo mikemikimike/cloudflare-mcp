@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { env, exports, WorkerEntrypoint } from 'cloudflare:workers'
-import type { McpServer } from '@modelcontextprotocol/server'
+import type { CallToolResult, McpServer } from '@modelcontextprotocol/server'
 import { CLOUDFLARE_TYPES } from '../constants'
 import type { FormatToolResult } from '../truncate'
 import { fetchWithRetry } from '../utils/fetch-retry'
@@ -13,9 +13,9 @@ import {
   unknownAccountHint
 } from '../auth/account-access'
 import type { AuthProps } from '../auth/types'
-import type { Connection } from '../api-permissions'
-import { isCatalogScope } from '../api-permissions'
+import { isCatalogScope, type Connection, type UntrustedEmptyList } from '../api-permissions'
 import {
+  explainEmptyListRequest,
   explainRefusedRequest,
   MISSING_SCOPE_HEADER,
   REFUSAL_HINT_HEADER
@@ -26,16 +26,22 @@ interface CodeExecutorEntrypoint {
   evaluate(): Promise<unknown>
 }
 
+/** What the sandbox reports about every run, whether the code returned or threw. */
+const RunReport = z.object({
+  // Paths of GETs whose list came back empty, which Cloudflare may have filtered by permission.
+  emptyReads: z.array(z.string()),
+  // Whether every request the code sent was a read or was refused, so rerunning repeats no change.
+  replaySafe: z.boolean()
+})
+
 /** What the sandbox reports back. It is untrusted, so it is parsed. */
 const Evaluation = z.union([
-  z.object({ ok: z.literal(true), result: z.unknown() }),
-  z.object({
+  RunReport.extend({ ok: z.literal(true), result: z.unknown() }),
+  RunReport.extend({
     ok: z.literal(false),
     message: z.string(),
     // The OAuth scope GlobalOutbound said the failing request lacked.
-    missingScope: z.string().optional(),
-    // Whether every request the code sent was a read or was refused, so rerunning repeats no change.
-    replaySafe: z.boolean()
+    missingScope: z.string().optional()
   })
 ])
 
@@ -140,6 +146,9 @@ ${accountIdPrelude}
 // Every request the code sends, and the status it got. Replaying the code after a
 // step-up is safe only if each one was a read or was refused.
 const sentRequests = [];
+// GET paths whose list came back empty. The host checks whether the connection
+// could see anything there, since Cloudflare filters some lists instead of refusing.
+const emptyReads = new Set();
 const outboundFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = async (input, init) => {
   const request = new Request(input, init);
@@ -254,22 +263,31 @@ export default class CodeExecutor extends WorkerEntrypoint {
           throw apiError(method, path, response, errors);
         }
 
-        return isEnvelope
+        const payload = isEnvelope
           ? { ...data, status: response.status }
           : { success: true, status: response.status, result: data };
+        if (String(method).toUpperCase() === "GET" && Array.isArray(payload.result)
+            && payload.result.length === 0) {
+          emptyReads.add(path.split("?")[0]);
+        }
+        return payload;
       }
     };
 
+    const report = () => ({
+      emptyReads: [...emptyReads],
+      replaySafe: sentRequests.every(({ method, status }) =>
+        method === "GET" || method === "HEAD" || status === 401 || status === 403)
+    });
     try {
       const result = await (${code})();
-      return { ok: true, result };
+      return { ok: true, result, ...report() };
     } catch (err) {
       return {
         ok: false,
         message: err instanceof Error ? err.message : String(err),
         missingScope: typeof err?.missingScope === "string" ? err.missingScope : undefined,
-        replaySafe: sentRequests.every(({ method, status }) =>
-          method === "GET" || method === "HEAD" || status === 401 || status === 403)
+        ...report()
       };
     }
   }
@@ -285,7 +303,10 @@ export default class CodeExecutor extends WorkerEntrypoint {
 }
 
 const UNSAFE_TO_REPLAY =
-  'Earlier requests in this program may already have changed resources, so it is not offered for an automatic retry. After the scope is granted, run only the steps that did not complete.'
+  'This program sent requests that may already have changed resources, so it is not offered for an automatic retry. After the scope is granted, run only the steps that still need it.'
+
+/** Empty-list explanations looked up per program, at most. Each is one catalog match. */
+const MAX_EMPTY_READS = 20
 
 /**
  * The scope to step up for when the code failed on a request refused for it.
@@ -298,6 +319,24 @@ function challengeableScope(execution: Execution, connection: Connection): strin
   if (execution.ok || connection.kind !== 'oauth' || !execution.missingScope) return undefined
   const scope = execution.missingScope
   return isCatalogScope(scope) && !connection.scopes.includes(scope) ? scope : undefined
+}
+
+/**
+ * Explain the empty lists the code got from reads the connection holds no
+ * accepted scope for. Distinct explanations, in the order the reads were sent.
+ */
+async function untrustedEmptyLists(
+  execution: Execution,
+  connection: Connection
+): Promise<UntrustedEmptyList[]> {
+  if (connection.kind !== 'oauth') return []
+  const paths = [...new Set(execution.emptyReads)].slice(0, MAX_EMPTY_READS)
+  const explained = await Promise.all(
+    paths.map((path) => explainEmptyListRequest(connection, path))
+  )
+  const byHint = new Map<string, UntrustedEmptyList>()
+  for (const entry of explained) if (entry) byHint.set(entry.hint, entry)
+  return [...byHint.values()]
 }
 
 /**
@@ -327,6 +366,13 @@ async () => {
   const body = [\`--\${b}\`, 'Content-Disposition: form-data; name="metadata"', 'Content-Type: application/json', '', JSON.stringify(metadata), \`--\${b}\`, 'Content-Disposition: form-data; name="script"', 'Content-Type: application/javascript', '', code, \`--\${b}--\`].join("\\r\\n");
   return cloudflare.request({ method: "PUT", path: \`/accounts/\${accountId}/workers/scripts/my-worker\`, body, contentType: \`multipart/form-data; boundary=\${b}\`, rawBody: true });
 }`
+
+/** Add paragraphs to a tool result's text. */
+function appendNotes(result: CallToolResult, notes: readonly string[]): void {
+  const text = notes.filter(Boolean).join('\n\n')
+  const [first] = result.content
+  if (text && first?.type === 'text') first.text += `\n\n${text}`
+}
 
 const ACCOUNT_ID_PARAM_DESCRIPTION =
   'Cloudflare account ID to run against. Optional when the session is authorized for exactly one account, and for account-independent calls such as GET /accounts.'
@@ -382,22 +428,29 @@ export function registerExecuteTool(
           missingAccountMessage(props, ACCOUNT_DISCOVERY_GUIDANCE),
           connection
         )
-        if (execution.ok)
-          return { content: [{ type: 'text', text: formatResult(execution.result) }] }
+        // An empty list from a read the connection holds no accepted scope for may
+        // be Cloudflare filtering, not an empty account. Say so even when the code
+        // only returned a count, and step up as for a refusal.
+        const emptyLists = await untrustedEmptyLists(execution, connection)
+        const result: CallToolResult = execution.ok
+          ? { content: [{ type: 'text', text: formatResult(execution.result) }] }
+          : formatError(execution.message)
+        const notes = emptyLists.map(({ hint }) => hint)
+        if (!execution.ok && account_id) notes.push(unknownAccountHint(props, account_id))
 
-        const failure = formatError(execution.message)
-        const hint = account_id ? unknownAccountHint(props, account_id) : ''
-        if (hint) failure.content[0].text += `\n\n${hint}`
-        const scope = challengeableScope(execution, connection)
-        if (!scope) return failure
-        if (!execution.replaySafe) {
-          failure.content[0].text += `\n\n${UNSAFE_TO_REPLAY}`
-          return failure
-        }
+        // A refusal that made the code fail comes first; otherwise the first empty
+        // list whose scope can be named (code reading `result[0]` fails on one, too).
+        const scope =
+          challengeableScope(execution, connection) ??
+          emptyLists.find((entry) => entry.scope)?.scope
+        if (scope && !execution.replaySafe) notes.push(UNSAFE_TO_REPLAY)
+        appendNotes(result, notes)
+        if (!scope || !execution.replaySafe) return result
+
         const challenge = scopeChallenge.require(scope)
         return challenge
-          ? { ...failure, _meta: { [WWW_AUTHENTICATE_META_KEY]: [challenge] } }
-          : failure
+          ? { ...result, _meta: { [WWW_AUTHENTICATE_META_KEY]: [challenge] } }
+          : result
       } catch (error) {
         const failure = formatError(error)
         const hint = account_id ? unknownAccountHint(props, account_id) : ''

@@ -3,8 +3,10 @@ import {
   acceptedPermissions,
   connectionFromAuth,
   DIRECT_CONNECTION,
+  explainEmptyList,
   explainRefusal,
   findOperation,
+  missingScopes,
   scopeToRequest
 } from '../src/api-permissions'
 
@@ -180,5 +182,64 @@ describe('scopeToRequest', () => {
     expect(scopeToRequest(401, oauth('dns.read'), 'GET', path, dns)).toBeUndefined()
     expect(scopeToRequest(403, lacking, 'GET', path, ['Billing Read'])).toBeUndefined()
     expect(scopeToRequest(403, lacking, 'GET', path, undefined)).toBeUndefined()
+  })
+})
+
+describe('missingScopes', () => {
+  const lacking = oauth('user:read', 'account:read')
+
+  it('lists every option when alternatives tie, naming none', () => {
+    expect(
+      missingScopes(lacking, 'GET', '/accounts/{account_id}/thing', ['DNS Read', 'Zone Read'])
+    ).toEqual({ options: ['dns.read', 'zone.read'], scope: undefined })
+  })
+
+  it('finds nothing missing when no OAuth scope covers the endpoint', () => {
+    expect(missingScopes(lacking, 'GET', '/accounts/{account_id}/x', ['Billing Read'])).toBe(
+      undefined
+    )
+  })
+})
+
+describe('explainEmptyList', () => {
+  const lacking = oauth('user:read', 'account:read')
+  const dns = ['DNS Read', 'DNS Write']
+  const path = '/zones/{zone_id}/dns_records'
+
+  it('distrusts an empty list from a read the connection holds no accepted scope for', () => {
+    const explained = explainEmptyList(lacking, 'GET', path, dns)
+
+    expect(explained?.scope).toBe('dns.read')
+    expect(explained?.hint).toContain(`GET ${path} returned an empty list`)
+    expect(explained?.hint).toContain('does not show that there are none')
+    expect(explained?.hint).toContain('grant `dns.read` (DNS Read)')
+  })
+
+  it('lists the options when no single scope stands out', () => {
+    const explained = explainEmptyList(lacking, 'GET', '/accounts/{account_id}/thing', [
+      'DNS Read',
+      'Zone Read'
+    ])
+
+    expect(explained?.scope).toBeUndefined()
+    expect(explained?.hint).toContain(
+      'grant one of: `dns.read` (DNS Read), `zone.read` (Zone Read)'
+    )
+  })
+
+  it('trusts the list when the connection holds an accepted scope', () => {
+    expect(explainEmptyList(oauth('dns.write'), 'GET', path, dns)).toBeUndefined()
+  })
+
+  it('trusts a direct credential, whose permissions are unknown', () => {
+    expect(explainEmptyList(DIRECT_CONNECTION, 'GET', path, dns)).toBeUndefined()
+  })
+
+  it('looks only at reads', () => {
+    expect(explainEmptyList(lacking, 'POST', path, dns)).toBeUndefined()
+  })
+
+  it('trusts the list when the spec lists no permissions', () => {
+    expect(explainEmptyList(lacking, 'GET', path, undefined)).toBeUndefined()
   })
 })

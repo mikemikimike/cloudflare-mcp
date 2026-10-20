@@ -191,15 +191,71 @@ function words(text: string): Set<string> {
   )
 }
 
+/** The OAuth scopes an endpoint accepts, none of which a connection holds. */
+export interface MissingScopes {
+  /** Every scope that would satisfy the endpoint, for the path's account or zone variant. */
+  readonly options: readonly string[]
+  /** The one scope to ask for, or `undefined` when no single one stands out. */
+  readonly scope: string | undefined
+}
+
+/**
+ * The OAuth scopes an endpoint accepts when an OAuth connection holds none of them.
+ *
+ * Any scope the endpoint accepts satisfies it, so the choice of `scope` only
+ * decides what the user is asked to grant: read scopes for GET/HEAD and write
+ * scopes otherwise, the account or zone variant that matches the path, then the
+ * scope whose name shares the most words with the path. A tie names no scope;
+ * callers list `options` instead.
+ *
+ * @param connection - The credential that made the request.
+ * @param method - The request method.
+ * @param path - The request path or template below the API base.
+ * @param permissions - What the endpoint accepts, from {@link acceptedPermissions}.
+ * @returns The missing scopes, or `undefined` when the connection's permissions
+ *   are unknown, the spec lists none, no OAuth scope covers the endpoint, or the
+ *   connection already holds one.
+ */
+export function missingScopes(
+  connection: Connection,
+  method: string,
+  path: string,
+  permissions: readonly string[] | undefined
+): MissingScopes | undefined {
+  if (connection.kind !== 'oauth' || !permissions) return undefined
+
+  const [own, other] =
+    path.split('/')[1] === 'zones' ? ['zone-', 'account-'] : ['account-', 'zone-']
+  const candidates = new Set<string>()
+  for (const permission of permissions) {
+    const scopes = SCOPES_BY_PERMISSION.get(permission) ?? []
+    // One permission name can be both an account and a zone scope (`access.read` and
+    // `zone-access.read`, `account-logs.read` and `logs.read`): keep the path's variant.
+    const prefixed = scopes.filter((scope) => scope.startsWith(own))
+    const variant = prefixed.length > 0 ? prefixed : scopes.filter((s) => !s.startsWith(other))
+    for (const scope of variant.length === 1 ? variant : scopes) candidates.add(scope)
+  }
+  if (candidates.size === 0) return undefined
+  if ([...candidates].some((scope) => connection.scopes.includes(scope))) return undefined
+
+  const reads = SAFE_METHODS.has(method.toUpperCase())
+  const preferred = [...candidates].filter((scope) => scope.endsWith('.read') === reads)
+  const pool = (preferred.length > 0 ? preferred : [...candidates]).sort()
+  if (pool.length === 1) return { options: pool, scope: pool[0] }
+
+  const pathWords = words(path.replace(/\{[^}]+\}/g, ''))
+  const ranked = pool
+    .map((scope) => ({ scope, overlap: [...words(scope)].filter((w) => pathWords.has(w)).length }))
+    .sort((a, b) => b.overlap - a.overlap)
+  return {
+    options: pool,
+    scope: ranked[0].overlap > ranked[1].overlap ? ranked[0].scope : undefined
+  }
+}
+
 /**
  * The one OAuth scope to challenge for after Cloudflare refused a request that
  * an OAuth connection lacked every accepted scope for.
- *
- * Any scope the endpoint accepts satisfies it, so the choice only decides what
- * the user is asked to grant: read scopes for GET/HEAD and write scopes
- * otherwise, the account or zone variant that matches the path, then the scope
- * whose name shares the most words with the path. A tie names no scope; the
- * refusal explanation lists the options instead.
  *
  * @param status - The HTTP status Cloudflare returned.
  * @param connection - The credential that made the request.
@@ -215,29 +271,51 @@ export function scopeToRequest(
   path: string,
   permissions: readonly string[] | undefined
 ): string | undefined {
-  if (!isRefusal(status) || connection.kind !== 'oauth' || !permissions) return undefined
+  if (!isRefusal(status)) return undefined
+  return missingScopes(connection, method, path, permissions)?.scope
+}
 
-  const [own, other] =
-    path.split('/')[1] === 'zones' ? ['zone-', 'account-'] : ['account-', 'zone-']
-  const candidates = new Set<string>()
-  for (const permission of permissions) {
-    const scopes = SCOPES_BY_PERMISSION.get(permission) ?? []
-    // One permission name can be both an account and a zone scope (`access.read` and
-    // `zone-access.read`, `account-logs.read` and `logs.read`): keep the path's variant.
-    const prefixed = scopes.filter((scope) => scope.startsWith(own))
-    const variant = prefixed.length > 0 ? prefixed : scopes.filter((s) => !s.startsWith(other))
-    for (const scope of variant.length === 1 ? variant : scopes) candidates.add(scope)
+/** Why an empty list can't be trusted, and the scope that would make it trustworthy. */
+export interface UntrustedEmptyList {
+  /** Guidance for the agent. */
+  readonly hint: string
+  /** The OAuth scope to challenge for, when one can be named. */
+  readonly scope: string | undefined
+}
+
+/**
+ * Explain an empty list Cloudflare returned for a read an OAuth connection holds
+ * no accepted scope for.
+ *
+ * Cloudflare refuses some endpoints without the permission (D1 answers `403`),
+ * but filters others down to what the credential may see: `GET /zones` without
+ * `zone.read` is `200` with an empty `result`. Such an empty list says nothing
+ * about whether the account has any, so it is treated like a refusal.
+ *
+ * A list with rows is trusted even without an accepted scope: `GET
+ * /accounts/{account_id}/members` returns rows without `memberships.read`, so
+ * the spec's permission names aren't strict enough to distrust those.
+ *
+ * @param connection - The credential that made the request.
+ * @param method - The request method. Only GET returns a list.
+ * @param path - The request path or template below the API base.
+ * @param permissions - What the endpoint accepts, from {@link acceptedPermissions}.
+ * @returns The explanation, or `undefined` when the empty list can be trusted.
+ */
+export function explainEmptyList(
+  connection: Connection,
+  method: string,
+  path: string,
+  permissions: readonly string[] | undefined
+): UntrustedEmptyList | undefined {
+  if (method.toUpperCase() !== 'GET') return undefined
+  const missing = missingScopes(connection, method, path, permissions)
+  if (!missing) return undefined
+  const grant = missing.scope
+    ? scopeLabel(missing.scope)
+    : `one of: ${list(missing.options.map(scopeLabel))}`
+  return {
+    hint: `GET ${path} returned an empty list, but this connection was not granted a scope this endpoint accepts. Cloudflare leaves out what a connection may not see instead of refusing, so this does not show that there are none. Reconnect and grant ${grant}.`,
+    scope: missing.scope
   }
-  if ([...candidates].some((scope) => connection.scopes.includes(scope))) return undefined
-
-  const reads = SAFE_METHODS.has(method.toUpperCase())
-  const preferred = [...candidates].filter((scope) => scope.endsWith('.read') === reads)
-  const pool = (preferred.length > 0 ? preferred : [...candidates]).sort()
-  if (pool.length <= 1) return pool[0]
-
-  const pathWords = words(path.replace(/\{[^}]+\}/g, ''))
-  const ranked = pool
-    .map((scope) => ({ scope, overlap: [...words(scope)].filter((w) => pathWords.has(w)).length }))
-    .sort((a, b) => b.overlap - a.overlap)
-  return ranked[0].overlap > ranked[1].overlap ? ranked[0].scope : undefined
 }

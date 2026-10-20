@@ -1,9 +1,11 @@
 import {
   acceptedPermissions,
+  explainEmptyList,
   explainRefusal,
   findOperation,
   scopeToRequest,
-  type Connection
+  type Connection,
+  type UntrustedEmptyList
 } from './api-permissions'
 import { getMcpTools, type McpTools } from './isolate-cache'
 
@@ -92,4 +94,28 @@ export async function explainRefusedRequest(
   const paths = await getPermissionPaths().catch(() => undefined)
   const match = paths ? findOperation(paths, method, path) : undefined
   return explainRefusalFor(status, connection, method, match?.template ?? path, match?.operation)
+}
+
+/**
+ * Explain an empty list from a GET to an `execute` request's path, when the
+ * OAuth connection holds no scope the endpoint accepts. Looks the endpoint up
+ * in `mcp-tools.json`.
+ *
+ * The sandbox reports which reads came back empty, so only those pay for the
+ * lookup. The path is untrusted: lying about it can only produce a challenge
+ * the code could also get by calling the endpoint.
+ *
+ * @param connection - The credential that made the request.
+ * @param path - The request path below the API base. A query string is ignored.
+ * @returns The explanation, or `undefined` when the empty list can be trusted.
+ */
+export async function explainEmptyListRequest(
+  connection: Connection,
+  path: string
+): Promise<UntrustedEmptyList | undefined> {
+  if (connection.kind !== 'oauth') return undefined
+  const paths = await getPermissionPaths().catch(() => undefined)
+  const match = paths ? findOperation(paths, 'GET', path.split('?')[0]) : undefined
+  if (!match) return undefined
+  return explainEmptyList(connection, 'GET', match.template, acceptedPermissions(match.operation))
 }
