@@ -6,6 +6,7 @@ import {
   MetricsEventIndexId,
   MetricsError,
   MetricsTracker,
+  ResponseSchemaMismatch,
   ToolCall
 } from '../src/metrics'
 import { API_BASE, cfSuccess, mockIdentityProbe } from './helpers/cloudflare-api'
@@ -46,6 +47,76 @@ describe('AuthUser', () => {
 
     expect(dp.indexes).toEqual([MetricsEventIndexId.AUTH_USER])
     expect(dp.blobs).toEqual(['cloudflare-api', '0.1.0', 'user-1', 'denied'])
+  })
+})
+
+describe('ResponseSchemaMismatch', () => {
+  it('keeps the shared slots and puts mismatch fields in the later ones', () => {
+    const event = new ResponseSchemaMismatch({
+      userId: 'user-1',
+      toolName: 'get_zones_dns_records',
+      method: 'GET',
+      pathTemplate: '/zones/{zone_id}/dns_records',
+      product: 'dns_records',
+      tag: 'DNS Records for a Zone',
+      responseKey: '200',
+      status: 200,
+      errorCount: 3,
+      counted: true,
+      sampleInterval: 4,
+      first: {
+        keyword: 'required',
+        schemaLocation: '#/components/schemas/dns-records_dns-record-response/required',
+        instancePath: '/result/*'
+      }
+    })
+    event.serverInfo = SERVER_INFO
+    const dp = event.toDataPoint()
+
+    expect(dp.indexes).toEqual([MetricsEventIndexId.RESPONSE_SCHEMA_MISMATCH])
+    expect(dp.indexes).toEqual(['response_schema_mismatch'])
+    expect(dp.blobs).toEqual([
+      'cloudflare-api', // blob1 server name
+      '0.1.0', // blob2 server version
+      'user-1', // blob3 userId
+      'get_zones_dns_records', // blob4 toolName
+      'GET', // blob5 method
+      '/zones/{zone_id}/dns_records', // blob6 path template
+      'dns_records', // blob7 product
+      'DNS Records for a Zone', // blob8 tag
+      '200', // blob9 response key
+      'required', // blob10 keyword
+      '#/components/schemas/dns-records_dns-record-response/required', // blob11 schema location
+      '/result/*' // blob12 instance path
+    ])
+    // double1 errorCode 0, double2 status, double3 count, double4 sample interval, double5 counted
+    expect(dp.doubles).toEqual([0, 200, 3, 4, 1])
+  })
+
+  it('writes null for an absent user or tag, keeping later positions in place', () => {
+    const event = new ResponseSchemaMismatch({
+      toolName: 't',
+      method: 'GET',
+      pathTemplate: '/p',
+      product: 'p',
+      responseKey: 'default',
+      status: 500,
+      errorCount: 1,
+      counted: false,
+      sampleInterval: 1,
+      first: {
+        keyword: 'type',
+        schemaLocation: '#/responses/default/schema/type',
+        instancePath: '/'
+      }
+    })
+    event.serverInfo = SERVER_INFO
+    const dp = event.toDataPoint()
+
+    expect(dp.blobs?.[2]).toBeNull()
+    expect(dp.blobs?.[7]).toBeNull()
+    expect(dp.blobs?.[8]).toBe('default')
+    expect(dp.doubles).toEqual([0, 500, 1, 1, 0])
   })
 })
 

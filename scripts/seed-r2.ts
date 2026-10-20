@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { processSpec, extractProducts } from '../src/spec-processor'
 import { MCP_TOOLS_KEY, buildMcpTools, type OperationInfo } from '../src/openapi'
+import { RESPONSE_SCHEMAS_KEY, buildResponseSchemas } from '../src/response-schemas'
 import { fetchSkills } from '../src/skills/sync'
 import { SKILLS_MANIFEST_KEY, skillFileKey } from '../src/skills/types'
 
@@ -32,6 +33,7 @@ const products = extractProducts(rawSpec)
 const productsJson = JSON.stringify(products)
 const paths = (processed as { paths: Record<string, Record<string, OperationInfo>> }).paths
 const mcpToolsJson = JSON.stringify(buildMcpTools(paths))
+const responseSchemasJson = JSON.stringify(buildResponseSchemas(rawSpec))
 
 console.log(`Spec: ${(specJson.length / 1024 / 1024).toFixed(1)} MB, ${products.length} products`)
 
@@ -43,6 +45,7 @@ const tmp = mkdtempSync(join(tmpdir(), 'mcp-seed-'))
 const specPath = join(tmp, 'spec.json')
 const productsPath = join(tmp, 'products.json')
 const mcpToolsPath = join(tmp, MCP_TOOLS_KEY)
+const responseSchemasPath = join(tmp, RESPONSE_SCHEMAS_KEY)
 const skillsManifestPath = join(tmp, 'skills-manifest.json')
 const skillFilesDir = join(tmp, 'skill-files')
 const skillFilesListPath = join(tmp, 'skill-files.json')
@@ -51,6 +54,7 @@ try {
   writeFileSync(specPath, specJson)
   writeFileSync(productsPath, productsJson)
   writeFileSync(mcpToolsPath, mcpToolsJson)
+  writeFileSync(responseSchemasPath, responseSchemasJson)
   writeFileSync(skillsManifestPath, skillsManifestJson)
   mkdirSync(skillFilesDir)
   const skillFiles = [...skills.blobs].map(([digest, bytes]) => {
@@ -71,6 +75,7 @@ try {
     ['spec.json', specPath],
     ['products.json', productsPath],
     [MCP_TOOLS_KEY, mcpToolsPath],
+    [RESPONSE_SCHEMAS_KEY, responseSchemasPath],
     [SKILLS_MANIFEST_KEY, skillsManifestPath]
   ] as const) {
     console.log(`Uploading ${key} to R2 (--env ${env})...`)

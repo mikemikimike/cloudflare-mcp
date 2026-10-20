@@ -13,6 +13,7 @@ import {
 } from './mcp-handler'
 import { processSpec, extractProducts } from './spec-processor'
 import { MCP_TOOLS_KEY, buildMcpTools, type OperationInfo } from './openapi'
+import { RESPONSE_SCHEMAS_KEY, buildResponseSchemas } from './response-schemas'
 import { syncSkills } from './skills/sync'
 
 const OPENAI_APPS_CHALLENGE_PATH = '/.well-known/openai-apps-challenge'
@@ -130,6 +131,7 @@ async function syncSpec(env: Env): Promise<void> {
   const productsJson = JSON.stringify(products)
   const paths = (processed as { paths: Record<string, Record<string, OperationInfo>> }).paths
   const mcpToolsJson = JSON.stringify(buildMcpTools(paths))
+  const responseSchemasJson = JSON.stringify(buildResponseSchemas(rawSpec))
 
   console.log(`Writing spec to R2 (${(specJson.length / 1024).toFixed(0)} KB)`)
   await Promise.all([
@@ -140,6 +142,9 @@ async function syncSpec(env: Env): Promise<void> {
       httpMetadata: { contentType: 'application/json' }
     }),
     env.SPEC_BUCKET.put(MCP_TOOLS_KEY, mcpToolsJson, {
+      httpMetadata: { contentType: 'application/json' }
+    }),
+    env.SPEC_BUCKET.put(RESPONSE_SCHEMAS_KEY, responseSchemasJson, {
       httpMetadata: { contentType: 'application/json' }
     })
   ])

@@ -2,6 +2,7 @@ import { env } from 'cloudflare:workers'
 import { resetIsolateCache } from '../../src/isolate-cache'
 import { clearR2 } from './r2'
 import { MCP_TOOLS_KEY, buildMcpTools, type OperationInfo } from '../../src/openapi'
+import { RESPONSE_SCHEMAS_KEY, buildResponseSchemas } from '../../src/response-schemas'
 
 /**
  * Spec-bucket test fixtures. @cloudflare/vitest-plugin gives each test FILE a real,
@@ -11,11 +12,22 @@ import { MCP_TOOLS_KEY, buildMcpTools, type OperationInfo } from '../../src/open
 
 type SpecPaths = Record<string, Record<string, OperationInfo>>
 
-/** Seed the real SPEC_BUCKET with a spec (+ products) and reset the cache. */
-export async function seedSpec(paths: SpecPaths, products: string[] = ['workers']): Promise<void> {
+/**
+ * Seed the real SPEC_BUCKET with a spec (+ products) and reset the cache.
+ * `components` are the raw spec's components, for response schemas that `$ref` them.
+ */
+export async function seedSpec(
+  paths: SpecPaths,
+  products: string[] = ['workers'],
+  components: Record<string, unknown> = {}
+): Promise<void> {
   await env.SPEC_BUCKET.put('spec.json', JSON.stringify({ paths }))
   await env.SPEC_BUCKET.put('products.json', JSON.stringify(products))
   await env.SPEC_BUCKET.put(MCP_TOOLS_KEY, JSON.stringify(buildMcpTools(paths)))
+  await env.SPEC_BUCKET.put(
+    RESPONSE_SCHEMAS_KEY,
+    JSON.stringify(buildResponseSchemas({ paths, components }))
+  )
   resetIsolateCache()
 }
 

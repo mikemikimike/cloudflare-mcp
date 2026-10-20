@@ -25,6 +25,9 @@ cloudflare-mcp/
 │   ├── executor.ts                # Code executor (Worker Loader API)
 │   ├── spec-processor.ts          # OpenAPI spec fetching & $ref resolution
 │   ├── truncate.ts                # Response truncation (~6K token limit)
+│   ├── response-schemas.ts        # Builds response-schemas.json (OpenAPI 3.0 → JSON Schema)
+│   ├── response-schema-check.ts   # Validates a response body against it, value-free results
+│   ├── response-validation.ts     # checkResponse(): sampling, waitUntil, mismatch events
 │   ├── metrics.ts                 # Analytics Engine metrics (auth_user/tool_call)
 │   ├── skills/
 │   │   ├── types.ts               # Skills extension wire + R2 manifest schemas (Zod)
@@ -54,7 +57,9 @@ cloudflare-mcp/
 │   ├── worker.test.ts             # Real worker end to end via exports.default.fetch
 │   └── *.test.ts
 ├── scripts/
-│   └── seed-r2.ts                 # Seed OpenAPI spec to R2 bucket
+│   ├── seed-r2.ts                 # Seed OpenAPI spec to R2 bucket
+│   ├── schema-mismatch-report.ts  # Response schema mismatches by product, for teams
+│   └── bench-response-validation.ts # Cost of response schema checks on the real spec
 ├── .github/workflows/
 │   ├── ci.yml                     # PR validation
 │   └── bonk.yml                   # AI code review
@@ -88,6 +93,7 @@ Node 22+ required.
 | `npm run check`        | Run all checks (format, lint, typecheck, test)|
 | `npm run seed:staging` | Seed OpenAPI spec to staging R2               |
 | `npm run seed:prod`    | Seed OpenAPI spec to production R2            |
+| `npm run report:schema-mismatches` | Response schema mismatch report (see below) |
 
 ## Code standards
 
@@ -157,9 +163,9 @@ The consent page offers minimal, read-only and full-access templates. Minimal is
 - Fetched from GitHub every six hours (scheduled handler, cron `0 */6 * * *`), alongside the skills sync; the two jobs run independently under `Promise.allSettled`
 - All `$ref` references resolved inline before storage
 - Products and minimal operation metadata extracted
-- Stored in R2 bucket (`SPEC_BUCKET`) as `spec.json`, `products.json`, and `mcp-tools.json`, the direct-tool catalogue for `?codemode=false`
+- Stored in R2 bucket (`SPEC_BUCKET`) as `spec.json`, `products.json`, `mcp-tools.json`, the direct-tool catalogue for `?codemode=false`, and `response-schemas.json` (see Response schema checks)
 - `mcp-tools.json` holds the final wire JSON Schemas (including the session-independent optional `account_id`) plus minimal request-routing metadata. Each isolate builds the `tools/list` payload from it once and serves it unchanged; `tools/call` lazily validates/dispatches only the requested operation with Zod. No per-endpoint SDK tools are registered
-- `src/isolate-cache.ts` caches all three artifacts for one hour in warm isolates. Concurrent requests on a cold isolate share one load, and a failed load is not cached. There is no fallback: a missing `mcp-tools.json` fails the request, so seed R2 (`npm run seed:staging` / `seed:prod`) before deploying a change to its key or shape
+- `src/isolate-cache.ts` caches the artifacts for one hour in warm isolates. Concurrent requests on a cold isolate share one load, and a failed load is not cached. There is no fallback: a missing `mcp-tools.json` fails the request, so seed R2 (`npm run seed:staging` / `seed:prod`) before deploying a change to its key or shape. A missing `response-schemas.json` only skips response checks
 
 ### Skills over MCP
 
@@ -205,11 +211,23 @@ Responses capped at ~6,000 tokens (~24KB). `src/truncate.ts` shrinks oversized J
 
 Clients that bound results themselves can pass `?truncateToolResult=false` to get whole results from `search`, `execute`, and the endpoint tools. `src/mcp-handler.ts` reads it next to `?codemode=false`; both are on unless the value is exactly `false`.
 
+### Response schema checks
+
+The direct tools check every JSON response, success or error, against the operation's OpenAPI response schema and record mismatches, so product teams can fix their schemas before tools advertise an `outputSchema`. Code Mode's `execute` is not checked.
+
+- **Artifact:** the scheduled handler and `seed-r2.ts` build `response-schemas.json` (~4 MB) from the raw spec with `buildResponseSchemas`. Component schemas are shared under `defs` and referenced as `#/$defs/<name>`. Operations are keyed `METHOD /path/template`, each with `product`, first `tag` and every response key's JSON body schema (`null` for a documented response without one). It is never part of `mcp-tools.json`, so `tools/list` doesn't load it. OpenAPI 3.0 is converted so that allowed responses aren't reported: `nullable` admits `null`, `writeOnly` properties leave `required`, patterns that don't compile as `u` regexes are dropped, and annotations are removed.
+- **Validation** (`src/response-schema-check.ts`): `@cfworker/json-schema` draft 4 (OpenAPI 3.0's `$ref` and `exclusiveMinimum` semantics). The schema is the status's own, then its class (`4XX`), then `default`. Validators compile per operation on first use and are cached per isolate. A short-circuit pass decides validity and finds the first violation; an invalid body is validated again to count every violation. Only the first 25 items of each array are checked (a mismatch almost always repeats), bounding cost to ~10 ms per response even for 40 MB bodies; `minItems`/`contains` errors on a trimmed array are ignored. Bodies over 1M characters are skipped. Measure with `npx tsx scripts/bench-response-validation.ts [openapi.json]`.
+- **Safety** (`src/response-validation.ts`): `checkResponse()` returns at once and runs in `waitUntil` after a macrotask yield, catching everything, so a broken artifact, schema, validator or Analytics Engine never changes or fails the tool result. `RESPONSE_VALIDATION_SAMPLE_RATE` (wrangler var, fraction 0-1, unset means 1) samples responses. A second direct-tools server calls the same `checkResponse({ toolName, method, pathTemplate, status, body, bodyChars, props })`.
+- **No customer data:** events and logs hold schema locations, keywords and instance paths only. Path segments that are array indices or keys the schema doesn't declare become `*`; a missing `required` property is appended only when the schema names it. The validator's message strings, which can contain keys, are never recorded.
+- **Recording:** one `response_schema_mismatch` Analytics Engine event per mismatching response (layout below) and one `console.warn` JSON line with up to five violations for Workers Logs.
+- **Report:** `CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_API_TOKEN=… npm run report:schema-mismatches -- [--env production|staging|dev] [--days 7] [--product dns_records] [--format markdown|json|sql]` groups mismatches by product → operation → violation, weighted by both sample rates. The token needs Account Analytics Read; `--format sql` prints the query.
+
 ### Usage metrics (Analytics Engine)
 
 Tool usage is tracked via the `MCP_METRICS` Analytics Engine binding into the shared `mcp-metrics-{dev,staging,production}` dataset — the same dataset used by the per-product Cloudflare MCP servers (`cloudflare/mcp-server-cloudflare`), so this server shows up alongside them under server name `cloudflare-api`.
 
 - `src/metrics.ts` mirrors the upstream `@repo/mcp-observability` schema. The blob/double layout is **positional and must not change**: `index1` = event type, `blob1`/`blob2` = server name/version (reserved), `blob3` = userId, `blob4` = toolName/errorMessage, `double1` = errorCode.
+- `response_schema_mismatch` (see Response schema checks) keeps those positions (`blob3` userId, `blob4` toolName, `double1` = 0) and adds: `blob5` method, `blob6` path template, `blob7` product, `blob8` first tag, `blob9` response key (`200`/`4XX`/`default`), `blob10` first violation's keyword, `blob11` its schema location (`#/components/schemas/<name>/…` or `#/responses/<key>/schema/…`), `blob12` its instance path (`/result/*/id`), `double2` HTTP status, `double3` violation count, `double4` sample interval (1 / `RESPONSE_VALIDATION_SAMPLE_RATE`), `double5` 1 if `double3` is exact, 0 if a lower bound.
 - `attachMetrics()` in `src/server.ts` wraps Code-Mode `registerTool` calls; the lazy non-Code-Mode dispatcher records the same `tool_call` events directly. `auth_user` events are emitted from the OAuth handler.
 - **No `session_start`**: MCP `2026-07-28` has no protocol sessions or `initialize` handshake. The 2025 compatibility path also creates a fresh server for each request and retains no initialization state. Client identity remains visible at the HTTP layer through `User-Agent` (including zone HTTP analytics).
 - The tracker is tolerant of a missing binding (no-op in tests/local dev) and swallows write errors so metrics can never break a tool call.
@@ -241,6 +259,7 @@ npm run test:watch    # Watch mode
 - Auth props building and validation
 - Spec processor ($ref resolution, product extraction)
 - Response truncation
+- Response schema artifact, validation and mismatch events (`tests/response-*.test.ts`)
 - Metrics event mapping & path normalization
 
 **End to end (`tests/worker.test.ts` and the other worker-level files):**

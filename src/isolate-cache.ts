@@ -2,6 +2,11 @@ import { env } from 'cloudflare:workers'
 import type { Tool } from '@modelcontextprotocol/server'
 import { MCP_TOOLS_KEY, type McpTool } from './openapi'
 import {
+  RESPONSE_SCHEMAS_KEY,
+  ResponseSchemasArtifact,
+  type ResponseSchemas
+} from './response-schemas'
+import {
   SKILLS_MANIFEST_KEY,
   SkillsManifest,
   skillFileKey,
@@ -11,7 +16,8 @@ import {
 
 /**
  * In-isolate cache for the R2 artifacts the scheduled handler writes
- * (`spec.json`, `products.json`, `mcp-tools.json`, the skills manifest and files).
+ * (`spec.json`, `products.json`, `mcp-tools.json`, `response-schemas.json`, the
+ * skills manifest and files).
  *
  * The MCP worker isolate stays warm across requests, so without this every
  * call re-read R2. The artifacts change at most every six hours, so a short TTL keeps a
@@ -119,6 +125,20 @@ export function getProducts(): Promise<string[]> {
   return products.get()
 }
 
+const responseSchemas = cached(async (): Promise<ResponseSchemas | null> => {
+  const object = await env.SPEC_BUCKET.get(RESPONSE_SCHEMAS_KEY)
+  if (!object) return null
+  return ResponseSchemasArtifact.parse(await object.json()) as ResponseSchemas
+})
+
+/**
+ * The direct tools' response schemas, loaded only when a response is checked.
+ * `null` until the scheduled handler first writes them; checking is skipped.
+ */
+export function getResponseSchemas(): Promise<ResponseSchemas | null> {
+  return responseSchemas.get()
+}
+
 /** The synced skills, indexed for `skills/get` and `resources/read`. */
 export interface SkillsIndex {
   readonly skills: readonly Skill[]
@@ -184,6 +204,7 @@ export function resetIsolateCache(): void {
   spec.reset()
   products.reset()
   mcpTools.reset()
+  responseSchemas.reset()
   skills.reset()
   skillFileBytes = new Map()
   skillFileCacheSize = 0

@@ -10,6 +10,7 @@ import { clearR2 } from './helpers/r2'
 import { mockSkillsArchive, skillMarkdown } from './helpers/skills'
 import { SKILLS_ARCHIVE_URL } from '../src/skills/sync'
 import { SKILLS_MANIFEST_KEY, SkillsManifest } from '../src/skills/types'
+import { RESPONSE_SCHEMAS_KEY } from '../src/response-schemas'
 import { server } from './setup/msw'
 import worker from '../src/index'
 
@@ -31,8 +32,20 @@ const RAW_SPEC = {
         summary: 'List Workers',
         tags: ['Workers Scripts'],
         parameters: [],
-        responses: { '200': { description: 'OK' } }
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': { schema: { $ref: '#/components/schemas/script-list' } }
+            }
+          }
+        }
       }
+    }
+  },
+  components: {
+    schemas: {
+      'script-list': { type: 'object', properties: { result: { type: 'array' } } }
     }
   }
 }
@@ -51,7 +64,7 @@ describe('scheduled handler', () => {
     mockSkillsArchive({ 'skills/wrangler/SKILL.md': skillMarkdown('wrangler', 'Use Wrangler') })
   )
 
-  it('fetches the spec from GitHub, processes it, and writes spec, products and mcp-tools.json to real R2', async () => {
+  it('fetches the spec from GitHub, processes it, and writes spec, products, mcp-tools.json and response-schemas.json to real R2', async () => {
     server.use(http.get(SPEC_URL, () => HttpResponse.json(RAW_SPEC)))
 
     await runScheduled()
@@ -88,6 +101,21 @@ describe('scheduled handler', () => {
     ])
     // account_id is optional for every session, decided at build time.
     expect(tools[0].inputSchema.required).toBeUndefined()
+    // Response schemas stay out of the tools/list payload.
+    expect(JSON.stringify(tools)).not.toContain('script-list')
+
+    const responseSchemas = await env.SPEC_BUCKET.get(RESPONSE_SCHEMAS_KEY)
+    expect(await responseSchemas!.json()).toEqual({
+      version: 1,
+      defs: { 'script-list': { type: 'object', properties: { result: { type: 'array' } } } },
+      operations: {
+        'GET /accounts/{account_id}/workers/scripts': {
+          product: 'workers',
+          tag: 'Workers Scripts',
+          responses: { '200': { $ref: '#/$defs/script-list' } }
+        }
+      }
+    })
   })
 
   it('throws and writes no spec artifacts when GitHub returns a non-2xx', async () => {
@@ -96,7 +124,7 @@ describe('scheduled handler', () => {
     await expect(runScheduled()).rejects.toThrow('Failed to fetch OpenAPI spec: 404')
 
     // No spec artifact was written; the independent skills sync still ran.
-    for (const key of ['spec.json', 'products.json', 'mcp-tools.json']) {
+    for (const key of ['spec.json', 'products.json', 'mcp-tools.json', RESPONSE_SCHEMAS_KEY]) {
       expect(await env.SPEC_BUCKET.get(key)).toBeNull()
     }
     expect(await env.SPEC_BUCKET.get(SKILLS_MANIFEST_KEY)).not.toBeNull()
